@@ -1,0 +1,398 @@
+import time
+import datetime
+import math
+import threading
+import requests
+import telebot
+from telebot import types
+
+BOT_TOKEN = "8038632149:AAG3ie65Q7aPY3S9ncuC64X5BSndRP3tkpc"
+bot = telebot.TeleBot(BOT_TOKEN)
+
+SYMBOL = "BTCUSDT"
+TIMEFRAME = "30m"  # 30 Dəqiqəlik (M30) Taymfreym
+
+SUBSCRIBED_CHATS = {6183826714}
+LAST_SIGNAL = "NONE"
+
+def fetch_binance_klines(symbol=SYMBOL, interval=TIMEFRAME, limit=300):
+    """
+    Binance API-dən şam məlumatlarını çəkir.
+    EMA200 indikatorunun dəqiq hesablanması üçün limit 300-ə yüksəldilib.
+    """
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        candles = []
+        for item in data:
+            candles.append({
+                'time': item[0],
+                'open': float(item[1]),
+                'high': float(item[2]),
+                'low': float(item[3]),
+                'close': float(item[4]),
+                'volume': float(item[5])
+            })
+        return candles
+    except Exception as e:
+        print(f"[XƏTA] Binance API klines çəkilərkən xəta: {e}")
+        return []
+
+def fetch_binance_ticker(symbol=SYMBOL):
+    url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+    try:
+        response = requests.get(url, timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[XƏTA] Ticker məlumatı çəkilərkən xəta: {e}")
+        return None
+
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return 50.0
+    
+    gains = 0.0
+    losses = 0.0
+    
+    for i in range(1, period + 1):
+        delta = prices[i] - prices[i - 1]
+        if delta >= 0:
+            gains += delta
+        else:
+            losses -= delta
+            
+    avg_gain = gains / period
+    avg_loss = losses / period
+    
+    for i in range(period + 1, len(prices)):
+        delta = prices[i] - prices[i - 1]
+        if delta >= 0:
+            avg_gain = (avg_gain * (period - 1) + delta) / period
+            avg_loss = (avg_loss * (period - 1)) / period
+        else:
+            avg_gain = (avg_gain * (period - 1)) / period
+            avg_loss = (avg_loss * (period - 1) - delta) / period
+            
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return float(100.0 - (100.0 / (1.0 + rs)))
+
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return prices[-1] if prices else 0.0
+    
+    ema = sum(prices[:period]) / period
+    multiplier = 2 / (period + 1)
+    
+    for price in prices[period:]:
+        ema = (price - ema) * multiplier + ema
+        
+    return float(ema)
+
+def calculate_macd(prices):
+    if len(prices) < 26:
+        return {'macd': 0.0, 'signal': 0.0, 'histogram': 0.0}
+    
+    macd_line = []
+    for i in range(26, len(prices) + 1):
+        sub_prices = prices[:i]
+        e12 = calculate_ema(sub_prices, 12)
+        e26 = calculate_ema(sub_prices, 26)
+        macd_line.append(e12 - e26)
+        
+    if len(macd_line) < 9:
+        return {'macd': macd_line[-1], 'signal': macd_line[-1], 'histogram': 0.0}
+        
+    signal_line = calculate_ema(macd_line, 9)
+    histogram = macd_line[-1] - signal_line
+    
+    return {
+        'macd': float(macd_line[-1]),
+        'signal': float(signal_line),
+        'histogram': float(histogram)
+    }
+
+def calculate_bollinger_bands(prices, period=20, num_std=2):
+    if len(prices) < period:
+        return {'upper': prices[-1], 'middle': prices[-1], 'lower': prices[-1]}
+    
+    sub_prices = prices[-period:]
+    mean = sum(sub_prices) / period
+    variance = sum((x - mean) ** 2 for x in sub_prices) / period
+    std = math.sqrt(variance)
+    
+    return {
+        'upper': mean + (std * num_std),
+        'middle': mean,
+        'lower': mean - (std * num_std)
+    }
+
+def calculate_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return candles[-1]['close'] * 0.015
+    
+    trs = []
+    for i in range(1, len(candles)):
+        h = candles[i]['high']
+        l = candles[i]['low']
+        pc = candles[i-1]['close']
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+        
+    sub_trs = trs[-period:]
+    return float(sum(sub_trs) / period)
+
+def analyze_30m_signal():
+    candles = fetch_binance_klines(SYMBOL, TIMEFRAME, limit=300)
+    if not candles:
+        return None
+    
+    closes = [c['close'] for c in candles]
+    live_price = closes[-1]
+    
+    rsi = calculate_rsi(closes, 14)
+    macd_obj = calculate_macd(closes)
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    ema200 = calculate_ema(closes, 200)
+    bb = calculate_bollinger_bands(closes, 20, 2)
+    atr = calculate_atr(candles, 14)
+    
+    score = 0
+    reasons = []
+    
+    if rsi < 30:
+        score += 30
+        reasons.append(f"RSI ({rsi:.1f}) - Aşırı Satış zonası [AL]")
+    elif rsi < 42:
+        score += 15
+        reasons.append(f"RSI ({rsi:.1f}) - Alış imkanı yaxınlaşır [AL]")
+    elif rsi > 70:
+        score -= 30
+        reasons.append(f"RSI ({rsi:.1f}) - Aşırı Alış zonası [SAT]")
+    elif rsi > 58:
+        score -= 15
+        reasons.append(f"RSI ({rsi:.1f}) - Satış təzyiqi var [SAT]")
+        
+    if macd_obj['histogram'] > 0 and macd_obj['macd'] > macd_obj['signal']:
+        score += 25
+        reasons.append("MACD - Qızıl Kəsişmə (Bullish Momentum)")
+    elif macd_obj['histogram'] < 0 and macd_obj['macd'] < macd_obj['signal']:
+        score -= 25
+        reasons.append("MACD - Ölüm Kəsişməsi (Bearish Momentum)")
+        
+    if live_price > ema20 and ema20 > ema50:
+        score += 25
+        reasons.append("EMA - Qiymət EMA20 və EMA50 üstündədir (Yüksələn Trend)")
+    elif live_price < ema20 and ema20 < ema50:
+        score -= 25
+        reasons.append("EMA - Qiymət EMA20 və EMA50 altındadır (Enən Trend)")
+
+    if live_price > ema200:
+        score += 10
+        reasons.append("EMA200 - Long-term Trend Yüksələndir")
+    else:
+        score -= 10
+        reasons.append("EMA200 - Long-term Trend Enəndir")
+        
+    if live_price <= bb['lower']:
+        score += 20
+        reasons.append("Bollinger - Alt dəstək xəttinə dəydi (Sıçrayış gözlənilir)")
+    elif live_price >= bb['upper']:
+        score -= 20
+        reasons.append("Bollinger - Üst müqavimət xəttinə dəydi")
+        
+    confidence = min(abs(score), 100)
+    
+    if score >= 50:
+        action = "GÜCLÜ AL 🚀"
+        signal_type = "BUY"
+    elif score >= 20:
+        action = "AL 📈"
+        signal_type = "BUY"
+    elif score <= -50:
+        action = "GÜCLÜ SAT 🛑"
+        signal_type = "SELL"
+    elif score <= -20:
+        action = "SAT 📉"
+        signal_type = "SELL"
+    else:
+        action = "GÖZLƏ (NEYTRAL) ⏳"
+        signal_type = "HOLD"
+        if not reasons:
+            reasons.append("Bazar neytral diapazondadır. Aydın trend siqnalı yoxdur.")
+
+    entry_price = live_price
+    if signal_type in ["BUY", "HOLD"]:
+        stop_loss = entry_price - (atr * 1.5)
+        tp1 = entry_price + (atr * 2.0)
+        tp2 = entry_price + (atr * 3.5)
+    else:
+        stop_loss = entry_price + (atr * 1.5)
+        tp1 = entry_price - (atr * 2.0)
+        tp2 = entry_price - (atr * 3.5)
+        
+    risk_reward = round((abs(tp1 - entry_price) / abs(entry_price - stop_loss)), 2) if abs(entry_price - stop_loss) > 0 else 2.0
+
+    return {
+        'symbol': SYMBOL,
+        'timeframe': TIMEFRAME,
+        'price': entry_price,
+        'action': action,
+        'signal_type': signal_type,
+        'confidence': confidence,
+        'stop_loss': stop_loss,
+        'tp1': tp1,
+        'tp2': tp2,
+        'risk_reward': risk_reward,
+        'rsi': rsi,
+        'macd': macd_obj['histogram'],
+        'ema20': ema20,
+        'ema200': ema200,
+        'reasons': reasons,
+        'time': datetime.datetime.now().strftime("%H:%M:%S (%d.%m.%Y)")
+    }
+
+def format_signal_message(data):
+    if not data:
+        return "⚠️ Qiymət məlumatı çəkilərkən xəta baş verdi."
+
+    reasons_str = "\n".join([f"• <i>{r}</i>" for r in data['reasons']])
+
+    msg = f"""
+<b>📊 BTC/USDT 30M CANLI SİQNAL ANALİZİ</b>
+──────────────────────
+<b>🎯 Əməliyyat Tövsiyəsi:</b> <code>{data['action']}</code>
+<b>⚡ Güvən Bütövlüyü:</b> <code>%{data['confidence']}</code>
+<b>⏰ Analiz Vaxtı:</b> <code>{data['time']}</code>
+
+<b>📌 MƏQSƏD VƏ RİSK SƏVİYYƏLƏRİ:</b>
+• <b>Giriş Qiyməti (Entry):</b> <code>${data['price']:,.2f}</code>
+• <b>Zərər Dayandırıcı (Stop Loss):</b> <code>${data['stop_loss']:,.2f}</code>
+• <b>Mənfəət Hədəfi 1 (TP 1):</b> <code>${data['tp1']:,.2f}</code>
+• <b>Mənfəət Hədəfi 2 (TP 2):</b> <code>${data['tp2']:,.2f}</code>
+• <b>Risk / Mükafat Nisbəti:</b> <code>1 : {data['risk_reward']}</code>
+
+<b>🔍 TEXNİKİ İNDİKATOR SƏBƏBLƏRİ:</b>
+{reasons_str}
+
+<b>📈 İndikator Dəyərləri:</b>
+• RSI (14): <code>{data['rsi']:.1f}</code>
+• MACD Histo: <code>{data['macd']:.2f}</code>
+• EMA 20: <code>${data['ema20']:,.1f}</code>
+• EMA 200: <code>${data['ema200']:,.1f}</code>
+
+⚠️ <i>Qeyd: Bu siqnal avtomatik 30 dəqiqəlik çoxlu-indikator uyğunluğu algoritmi ilə hesablanmışdır. Risk idarəetməsinə riayət edin.</i>
+    """
+    return msg
+
+def main_keyboard():
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    btn_signal = types.KeyboardButton("📊 30M Canlı Siqnal Al")
+    btn_price = types.KeyboardButton("💰 Canlı BTC Qiyməti")
+    btn_auto_on = types.KeyboardButton("🔔 Avto-Bildiriş Qoş")
+    btn_auto_off = types.KeyboardButton("🔕 Avto-Bildiriş Söndür")
+    markup.add(btn_signal, btn_price)
+    markup.add(btn_auto_on, btn_auto_off)
+    return markup
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    welcome_text = (
+        "<b>👋 Salam! Peşəkar BTC/USDT 30M Siqnal Botuna Xoş Gelmisiniz.</b>\n\n"
+        "Bu bot Binance üzərindən canlı 30 dəqiqəlik (M30) BTC qiymətini çəkir və "
+        "<b>RSI, MACD, EMA 20/50/200, Bollinger Bands və ATR</b> indikatorlarını birlikdə "
+        "analiz edərək dəqiq Al/Sat siqnalları və Stop Loss / Take Profit hədəfləri verir.\n\n"
+        "Aşağıdakı menyu düymələrindən istifadə edə bilərsiniz:"
+    )
+    bot.send_message(message.chat.id, welcome_text, parse_mode='HTML', reply_markup=main_keyboard())
+
+@bot.message_handler(func=lambda message: message.text == "📊 30M Canlı Siqnal Al" or message.text == "/signal")
+def send_signal(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    signal_data = analyze_30m_signal()
+    msg = format_signal_message(signal_data)
+    bot.send_message(message.chat.id, msg, parse_mode='HTML')
+
+@bot.message_handler(func=lambda message: message.text == "💰 Canlı BTC Qiyməti" or message.text == "/price")
+def send_price(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    ticker = fetch_binance_ticker()
+    if ticker:
+        price = float(ticker['lastPrice'])
+        change = float(ticker['priceChangePercent'])
+        high = float(ticker['highPrice'])
+        low = float(ticker['lowPrice'])
+        volume = float(ticker['volume'])
+        
+        change_icon = "🟢 +" if change >= 0 else "🔴 "
+        
+        msg = f"""
+<b>💰 BTC/USDT CANLI BİNANCE QİYMƏTİ</b>
+──────────────────────
+• <b>Cari Qiymət:</b> <code>${price:,.2f}</code>
+• <b>24s Dəyişiklik:</b> <code>{change_icon}{change:.2f}%</code>
+• <b>24s Ən Yüksək:</b> <code>${high:,.2f}</code>
+• <b>24s Ən Aşağı:</b> <code>${low:,.2f}</code>
+• <b>24s Həcm:</b> <code>{volume:,.2f} BTC</code>
+• <b>Taymfreym:</b> <code>30m (M30)</code>
+        """
+        bot.send_message(message.chat.id, msg, parse_mode='HTML')
+    else:
+        bot.send_message(message.chat.id, "❌ Qiymət məlumatı çəkilə bilmədi.")
+
+@bot.message_handler(func=lambda message: message.text == "🔔 Avto-Bildiriş Qoş" or message.text == "/auto_on")
+def enable_auto(message):
+    SUBSCRIBED_CHATS.add(message.chat.id)
+    bot.send_message(
+        message.chat.id, 
+        "✅ <b>Avto-Bildirişlər aktiv edildi!</b>\n30M taymfreymdə yeni AL/SAT siqnalı yaranan kimi size avtomatik mesaj gələcək.",
+        parse_mode='HTML'
+    )
+
+@bot.message_handler(func=lambda message: message.text == "🔕 Avto-Bildiriş Söndür" or message.text == "/auto_off")
+def disable_auto(message):
+    if message.chat.id in SUBSCRIBED_CHATS:
+        SUBSCRIBED_CHATS.remove(message.chat.id)
+    bot.send_message(message.chat.id, "🛑 <b>Avto-Bildirişlər söndürüldü.</b>", parse_mode='HTML')
+
+def auto_signal_scanner():
+    global LAST_SIGNAL
+    print("[LOG] Avtomatik M30 Siqnal Skaneri başladıldı...")
+    
+    while True:
+        try:
+            signal_data = analyze_30m_signal()
+            if signal_data and signal_data['signal_type'] in ['BUY', 'SELL']:
+                current_action = signal_data['action']
+                
+                if current_action != LAST_SIGNAL:
+                    LAST_SIGNAL = current_action
+                    msg = "🚨 <b>YENİ M30 SİQNAL XƏBƏRDARLIĞI!</b>\n" + format_signal_message(signal_data)
+                    
+                    for chat_id in list(SUBSCRIBED_CHATS):
+                        try:
+                            bot.send_message(chat_id, msg, parse_mode='HTML')
+                        except Exception as err:
+                            print(f"[XƏTA] Chat ID {chat_id} mesaj göndərilə bilmədi: {err}")
+                            
+        except Exception as e:
+            print(f"[XƏTA] Skaner dövrəsində xəta: {e}")
+            
+        time.sleep(60)
+
+if __name__ == "__main__":
+    print("==========================================")
+    print("🚀 BTC/USDT 30M Telegram Botu İşe Düşdü!")
+    print("==========================================")
+    
+    scanner_thread = threading.Thread(target=auto_signal_scanner, daemon=True)
+    scanner_thread.start()
+    
+    try:
+        bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    except Exception as e:
+        print(f"[XƏTA] Bot infinity_polling kəsildi: {e}")
